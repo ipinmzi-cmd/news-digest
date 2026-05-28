@@ -1,0 +1,4 @@
+.venv/
+news.html
+__pycache__/
+*.pyc
