@@ -325,12 +325,18 @@ def build_html(all_data, generated_at):
 # ── Email ─────────────────────────────────────────────────────────────
 
 def load_config():
-    """讀取 config.json；不存在時回傳 None。"""
+    """讀取 config.json；不存在時改從環境變數讀取（GitHub Actions 用）。"""
     cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-    if not os.path.exists(cfg_path):
-        return None
-    with open(cfg_path, encoding="utf-8") as f:
-        return json.load(f)
+    if os.path.exists(cfg_path):
+        with open(cfg_path, encoding="utf-8") as f:
+            return json.load(f)
+    # GitHub Actions：從環境變數讀取
+    user      = os.environ.get("GMAIL_USER")
+    password  = os.environ.get("GMAIL_APP_PASSWORD")
+    recipient = os.environ.get("RECIPIENT")
+    if user and password and recipient:
+        return {"gmail_user": user, "gmail_app_password": password, "recipient": recipient}
+    return None
 
 
 def build_email_html(all_data, generated_at):
