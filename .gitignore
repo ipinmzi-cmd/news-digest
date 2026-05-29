@@ -1,4 +1,5 @@
 .venv/
 news.html
+config.json
 __pycache__/
 *.pyc
