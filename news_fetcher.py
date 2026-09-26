@@ -12,6 +12,7 @@ from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
 # ── 設定 ──────────────────────────────────────────────────────────────
+
 MAX_PER_FEED = 5
 
 FEEDS = {
@@ -80,34 +81,67 @@ def is_english(text):
     return ascii_alpha / total > 0.65 and cjk < 3
 
 
+def _translate_chunk_google(chunk):
+    """用 Google 翻譯（deep_translator 免費端點）翻譯一批文字。失敗就丟出例外。"""
+    from deep_translator import GoogleTranslator
+    translator = GoogleTranslator(source="en", target="zh-TW")
+    translated = translator.translate_batch(chunk)
+    return [t if t else chunk[j] for j, t in enumerate(translated)]
+
+
+def _translate_chunk_mymemory(chunk):
+    """備援翻譯引擎：MyMemory。Google 被擋時使用（逐句翻譯，較慢但獨立於 Google 的封鎖）。"""
+    from deep_translator import MyMemoryTranslator
+    translator = MyMemoryTranslator(source="en-GB", target="zh-TW")
+    result = []
+    for text in chunk:
+        try:
+            t = translator.translate(text[:490])  # MyMemory 單次字數上限較低
+            result.append(t if t else text)
+        except Exception:
+            result.append(text)
+        time.sleep(0.2)
+    return result
+
+
 def translate_batch(texts):
-    """批次翻譯英文文字為繁體中文，出錯時回傳原文。"""
+    """批次翻譯英文文字為繁體中文。Google 翻譯失敗（常見於雲端 IP 被封）時
+    自動改用 MyMemory 備援；兩者都失敗才保留原文。"""
     if not texts:
         return texts
-    try:
-        from deep_translator import GoogleTranslator
-        translator = GoogleTranslator(source="en", target="zh-TW")
-        result = []
-        chunk_size = 20
-        for i in range(0, len(texts), chunk_size):
-            chunk = texts[i:i + chunk_size]
+
+    result = []
+    chunk_size = 20
+    google_failed_once = False
+
+    for i in range(0, len(texts), chunk_size):
+        chunk = texts[i:i + chunk_size]
+        translated = None
+
+        # 1) 先試 Google 翻譯
+        try:
+            translated = _translate_chunk_google(chunk)
+        except Exception as e:
+            google_failed_once = True
+            print(f" Google 翻譯失敗（改用備援引擎）：{e}")
+
+        # 2) Google 失敗 → 試 MyMemory 備援
+        if translated is None:
             try:
-                translated = translator.translate_batch(chunk)
-                result.extend(t if t else chunk[j] for j, t in enumerate(translated))
-            except Exception:
-                # 單批次失敗時逐條翻譯，再失敗就保留原文
-                for text in chunk:
-                    try:
-                        t = translator.translate(text[:400])
-                        result.append(t if t else text)
-                    except Exception:
-                        result.append(text)
-            if i + chunk_size < len(texts):
-                time.sleep(0.3)
-        return result
-    except Exception as e:
-        print(f"  翻譯失敗：{e}")
-        return texts
+                translated = _translate_chunk_mymemory(chunk)
+            except Exception as e2:
+                print(f" 備援翻譯（MyMemory）也失敗：{e2}")
+                translated = chunk  # 兩者都失敗，保留原文
+
+        result.extend(translated)
+
+        if i + chunk_size < len(texts):
+            time.sleep(0.3)
+
+    if google_failed_once:
+        print(" 提醒：Google 翻譯端點今天被擋，已改用備援引擎完成翻譯。")
+
+    return result
 
 
 # ── 抓取 ──────────────────────────────────────────────────────────────
@@ -142,7 +176,6 @@ def translate_all(all_data):
     """掃描所有 item，將英文標題與摘要翻譯為繁體中文。"""
     locations = []
     texts = []
-
     for cat, sources in all_data.items():
         for src_idx, (src_name, items) in enumerate(sources):
             for item_idx, item in enumerate(items):
@@ -153,10 +186,10 @@ def translate_all(all_data):
                         texts.append(text)
 
     if not texts:
-        print("  無英文內容需翻譯")
+        print(" 無英文內容需翻譯")
         return all_data
 
-    print(f"  翻譯 {len(texts)} 則英文內容...")
+    print(f" 翻譯 {len(texts)} 則英文內容...")
     translated = translate_batch(texts)
 
     for (cat, src_idx, item_idx, field), tr_text in zip(locations, translated):
@@ -180,6 +213,7 @@ def build_html(all_data, generated_at):
         icon = CATEGORY_ICONS.get(cat, "📰")
         color = CATEGORY_COLORS.get(cat, "#333")
         cat_id = f"cat-{cat_keys.index(cat)}"
+
         cards = ""
         for src_name, items in sources:
             news_items = ""
@@ -191,133 +225,134 @@ def build_html(all_data, generated_at):
                 )
                 news_items += f"""
                 <li>
-                  <a href="{item['link']}" target="_blank" rel="noopener">{html.escape(item['title'])}</a>
-                  {time_badge}
-                  {summary_html}
+                    <a href="{item['link']}" target="_blank" rel="noopener">{html.escape(item['title'])}</a>
+                    {time_badge}
+                    {summary_html}
                 </li>"""
+
             cards += f"""
             <div class="card">
-              <div class="card-header" style="border-left:4px solid {color};">
-                <span class="src-name">{src_name}</span>
-              </div>
-              <ul class="news-list">{news_items}</ul>
+                <div class="card-header" style="border-left:4px solid {color};">
+                    <span class="src-name">{src_name}</span>
+                </div>
+                <ul class="news-list">{news_items}</ul>
             </div>"""
 
         category_sections += f"""
         <section class="category" id="{cat_id}">
-          <h2 class="cat-title" style="color:{color};">{icon} {cat}</h2>
-          <div class="cards-grid">{cards}</div>
+            <h2 class="cat-title" style="color:{color};">{icon} {cat}</h2>
+            <div class="cards-grid">{cards}</div>
         </section>"""
 
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>新聞摘要</title>
-  <style>
-    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{
-      font-family: -apple-system, "Segoe UI", "PingFang TC", "Microsoft JhengHei", sans-serif;
-      background: #f1f5f9;
-      color: #1e293b;
-      line-height: 1.6;
-    }}
-    header {{
-      background: #0f172a;
-      color: #f8fafc;
-      padding: 20px 32px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-    }}
-    header h1 {{ font-size: 1.4rem; letter-spacing: 0.05em; }}
-    header .meta {{ font-size: 0.8rem; color: #94a3b8; white-space: nowrap; }}
-    nav {{
-      background: #1e293b;
-      padding: 8px 32px;
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-    }}
-    nav a {{
-      color: #cbd5e1;
-      text-decoration: none;
-      font-size: 0.85rem;
-      padding: 4px 12px;
-      border-radius: 4px;
-      transition: background 0.15s;
-    }}
-    nav a:hover {{ background: #334155; color: #f1f5f9; }}
-    main {{ max-width: 1400px; margin: 0 auto; padding: 24px 24px 48px; }}
-    .category {{ margin-bottom: 40px; scroll-margin-top: 12px; }}
-    .cat-title {{
-      font-size: 1.15rem;
-      font-weight: 700;
-      margin-bottom: 14px;
-      padding-bottom: 6px;
-      border-bottom: 2px solid currentColor;
-    }}
-    .cards-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-      gap: 14px;
-    }}
-    .card {{
-      background: #fff;
-      border-radius: 8px;
-      box-shadow: 0 1px 4px rgba(0,0,0,.08);
-      overflow: hidden;
-    }}
-    .card-header {{
-      padding: 8px 12px;
-      background: #f8fafc;
-    }}
-    .src-name {{ font-size: 0.8rem; font-weight: 600; color: #475569; }}
-    .news-list {{ list-style: none; }}
-    .news-list li {{
-      padding: 10px 14px;
-      border-bottom: 1px solid #f1f5f9;
-    }}
-    .news-list li:last-child {{ border-bottom: none; }}
-    .news-list a {{
-      color: #1e293b;
-      text-decoration: none;
-      font-weight: 500;
-      font-size: 0.875rem;
-      display: block;
-      line-height: 1.4;
-    }}
-    .news-list a:hover {{ color: #2563eb; text-decoration: underline; }}
-    .time {{
-      display: inline-block;
-      font-size: 0.7rem;
-      color: #94a3b8;
-      margin-top: 3px;
-    }}
-    .summary {{
-      font-size: 0.75rem;
-      color: #64748b;
-      margin-top: 4px;
-      line-height: 1.5;
-    }}
-    footer {{
-      text-align: center;
-      padding: 20px;
-      color: #94a3b8;
-      font-size: 0.78rem;
-    }}
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>新聞摘要</title>
+<style>
+*, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{
+    font-family: -apple-system, "Segoe UI", "PingFang TC", "Microsoft JhengHei", sans-serif;
+    background: #f1f5f9;
+    color: #1e293b;
+    line-height: 1.6;
+}}
+header {{
+    background: #0f172a;
+    color: #f8fafc;
+    padding: 20px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}}
+header h1 {{ font-size: 1.4rem; letter-spacing: 0.05em; }}
+header .meta {{ font-size: 0.8rem; color: #94a3b8; white-space: nowrap; }}
+nav {{
+    background: #1e293b;
+    padding: 8px 32px;
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+}}
+nav a {{
+    color: #cbd5e1;
+    text-decoration: none;
+    font-size: 0.85rem;
+    padding: 4px 12px;
+    border-radius: 4px;
+    transition: background 0.15s;
+}}
+nav a:hover {{ background: #334155; color: #f1f5f9; }}
+main {{ max-width: 1400px; margin: 0 auto; padding: 24px 24px 48px; }}
+.category {{ margin-bottom: 40px; scroll-margin-top: 12px; }}
+.cat-title {{
+    font-size: 1.15rem;
+    font-weight: 700;
+    margin-bottom: 14px;
+    padding-bottom: 6px;
+    border-bottom: 2px solid currentColor;
+}}
+.cards-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 14px;
+}}
+.card {{
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.08);
+    overflow: hidden;
+}}
+.card-header {{
+    padding: 8px 12px;
+    background: #f8fafc;
+}}
+.src-name {{ font-size: 0.8rem; font-weight: 600; color: #475569; }}
+.news-list {{ list-style: none; }}
+.news-list li {{
+    padding: 10px 14px;
+    border-bottom: 1px solid #f1f5f9;
+}}
+.news-list li:last-child {{ border-bottom: none; }}
+.news-list a {{
+    color: #1e293b;
+    text-decoration: none;
+    font-weight: 500;
+    font-size: 0.875rem;
+    display: block;
+    line-height: 1.4;
+}}
+.news-list a:hover {{ color: #2563eb; text-decoration: underline; }}
+.time {{
+    display: inline-block;
+    font-size: 0.7rem;
+    color: #94a3b8;
+    margin-top: 3px;
+}}
+.summary {{
+    font-size: 0.75rem;
+    color: #64748b;
+    margin-top: 4px;
+    line-height: 1.5;
+}}
+footer {{
+    text-align: center;
+    padding: 20px;
+    color: #94a3b8;
+    font-size: 0.78rem;
+}}
+</style>
 </head>
 <body>
-  <header>
+<header>
     <h1>📰 每日新聞摘要</h1>
     <span class="meta">更新時間：{generated_at}</span>
-  </header>
-  <nav>{nav_links}</nav>
-  <main>{category_sections}</main>
-  <footer>資料來源：各媒體 RSS Feed（中立聚合）&nbsp;|&nbsp; 英文內容已自動翻譯為繁體中文</footer>
+</header>
+<nav>{nav_links}</nav>
+<main>{category_sections}</main>
+<footer>資料來源：各媒體 RSS Feed（中立聚合）&nbsp;|&nbsp; 英文內容已自動翻譯為繁體中文</footer>
 </body>
 </html>"""
 
@@ -330,12 +365,14 @@ def load_config():
     if os.path.exists(cfg_path):
         with open(cfg_path, encoding="utf-8") as f:
             return json.load(f)
+
     # GitHub Actions：從環境變數讀取
-    user      = os.environ.get("GMAIL_USER")
-    password  = os.environ.get("GMAIL_APP_PASSWORD")
+    user = os.environ.get("GMAIL_USER")
+    password = os.environ.get("GMAIL_APP_PASSWORD")
     recipient = os.environ.get("RECIPIENT")
     if user and password and recipient:
         return {"gmail_user": user, "gmail_app_password": password, "recipient": recipient}
+
     return None
 
 
@@ -343,7 +380,7 @@ def build_email_html(all_data, generated_at):
     """產生適合 email client 的內嵌樣式 HTML（不依賴 CSS Grid）。"""
     category_blocks = ""
     for cat, sources in all_data.items():
-        icon  = CATEGORY_ICONS.get(cat, "📰")
+        icon = CATEGORY_ICONS.get(cat, "📰")
         color = CATEGORY_COLORS.get(cat, "#333")
 
         source_blocks = ""
@@ -376,23 +413,23 @@ def build_email_html(all_data, generated_at):
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>每日新聞摘要 {generated_at}</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>每日新聞摘要 {generated_at}</title>
 </head>
 <body style="margin:0;padding:0;background:#f1f5f9;font-family:Arial,'Microsoft JhengHei',sans-serif;">
-  <div style="max-width:680px;margin:24px auto;background:#fff;border-radius:8px;
-              overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1);">
+<div style="max-width:680px;margin:24px auto;background:#fff;border-radius:8px;
+            overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1);">
     <div style="background:#0f172a;padding:20px 28px;">
-      <h1 style="margin:0;color:#f8fafc;font-size:18px;">📰 每日新聞摘要</h1>
-      <p style="margin:5px 0 0;color:#94a3b8;font-size:12px;">{generated_at}</p>
+        <h1 style="margin:0;color:#f8fafc;font-size:18px;">📰 每日新聞摘要</h1>
+        <p style="margin:5px 0 0;color:#94a3b8;font-size:12px;">{generated_at}</p>
     </div>
     {category_blocks}
     <div style="padding:14px 28px;background:#f8fafc;text-align:center;
                 color:#94a3b8;font-size:11px;">
-      資料來源：各媒體 RSS Feed（中立聚合）｜英文內容已自動翻譯為繁體中文
+        資料來源：各媒體 RSS Feed（中立聚合）｜英文內容已自動翻譯為繁體中文
     </div>
-  </div>
+</div>
 </body>
 </html>"""
 
@@ -401,8 +438,8 @@ def send_email(email_html, generated_at, config):
     """透過 Gmail SMTP 寄出 HTML 信件。"""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"📰 每日新聞摘要 {generated_at}"
-    msg["From"]    = config["gmail_user"]
-    msg["To"]      = config["recipient"]
+    msg["From"] = config["gmail_user"]
+    msg["To"] = config["recipient"]
     msg.attach(MIMEText(email_html, "html", "utf-8"))
 
     print(f"正在寄送到 {config['recipient']}...")
